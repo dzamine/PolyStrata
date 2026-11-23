@@ -245,6 +245,36 @@ class ServiceForInkling(unittest.TestCase):
         done = [e for kind, e in self.svc.run(ids, True, None, 64, {}, threading.Event()) if kind == "done"][0]
         self.assertEqual(done["reasoning_tokens"], len(self.tok.encode("the capital of Italy" + END, parse_special=True)))
 
+    def test_a_thinking_budget_closes_the_thinking_block(self):
+        # a reply that thinks on: the budget (the request's, or the answer room's quarter of max_tokens) ends the
+        # thinking block with <|end_message|> and opens the next one, and the model answers there.  The budget was
+        # dropped for Inkling 2 (no </think>), so the reply thought to max_tokens and had no answer
+        for budget, max_new, thought in ((100, 2000, 100), (0, 2048, 1536)):
+            with self.subTest(budget=budget, max_new=max_new):
+                self.svc.reasoning_budget_tokens = budget
+                ids = self.svc.encode_prompt(self.chat, None, {})
+                self.svc.engine = MockEngine(self.tok, ["<|message_model|><|content_thinking|>" + "loop " * 2000,
+                                                        "<|content_text|>Rome" + END + STOP])
+                out = list(self.svc.run(ids, True, None, max_new, {}, threading.Event()))
+                evs = [e for kind, e in out if kind == "event"]
+                done = [e for kind, e in out if kind == "done"][0]
+                self.assertEqual(said(evs, "content"), "Rome")
+                self.assertEqual(done["finish"], "stop")
+                self.assertTrue(said(evs, "reasoning").endswith("time to give my answer."))
+                self.assertEqual(self.tok.decode(self.svc.engine.last_prompt[-2:]), END + "<|message_model|>")
+                self.assertGreaterEqual(done["reasoning_tokens"], thought)
+
+    def test_a_call_after_the_budget_closed_the_thinking(self):
+        self.svc.reasoning_budget_tokens = 50
+        tools = [{"name": "get_weather", "parameters": {"properties": {"city": {"type": "string"}}}}]
+        ids = self.svc.encode_prompt(self.chat, tools, {})
+        self.svc.engine = MockEngine(self.tok, ["<|message_model|><|content_thinking|>" + "hmm " * 500,
+                                                'get_weather<|content_invoke_tool_json|>{"name":"get_weather",'
+                                                '"args":{"city":"Rome"}}' + END + STOP])
+        evs = [e for kind, e in self.svc.run(ids, True, tools, 1000, {}, threading.Event()) if kind == "event"]
+        self.assertEqual([(e.call.name, e.call.arguments) for e in evs if e.kind == "tool_call"],
+                         [("get_weather", {"city": "Rome"})])
+
 
 def model_template() -> ChatTemplate:
     with tempfile.TemporaryDirectory() as d:
